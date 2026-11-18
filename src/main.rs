@@ -7,7 +7,9 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use ui::{App, Modal, Tab, TerminalGuard};
@@ -15,6 +17,13 @@ use ui::{App, Modal, Tab, TerminalGuard};
 enum BgEvent {
     AiCommitDone(Result<String, String>, bool /* is_quick */),
     PushDone(Result<String, String>),
+    RepoStateChanged {
+        path: PathBuf,
+        branch: String,
+        changes: Vec<git::ChangeItem>,
+        unpushed: usize,
+        history: Vec<git::CommitItem>,
+    },
 }
 
 fn main() {
@@ -72,18 +81,92 @@ fn main() {
         a
     };
 
+    let shared_repo_path = Arc::new(Mutex::new(app.repo_path.clone()));
+    let is_modal_busy = Arc::new(AtomicBool::new(false));
+
     let _guard = TerminalGuard::init();
     let (tx, rx): (Sender<BgEvent>, Receiver<BgEvent>) = channel();
 
-    run_event_loop(&mut app, &config, tx, rx);
+    start_repo_watcher(
+        shared_repo_path.clone(),
+        is_modal_busy.clone(),
+        tx.clone(),
+    );
+
+    run_event_loop(&mut app, &config, tx, rx, shared_repo_path, is_modal_busy);
+}
+
+fn start_repo_watcher(
+    shared_path: Arc<Mutex<PathBuf>>,
+    busy: Arc<AtomicBool>,
+    tx: Sender<BgEvent>,
+) {
+    thread::spawn(move || {
+        let mut last_repo = PathBuf::new();
+        let mut last_fingerprint = String::new();
+
+        loop {
+            thread::sleep(Duration::from_millis(800));
+
+            if busy.load(Ordering::Relaxed) {
+                continue;
+            }
+
+            let repo_path = match shared_path.lock() {
+                Ok(guard) => guard.clone(),
+                Err(_) => continue,
+            };
+
+            if !git::is_git_repo(&repo_path) {
+                continue;
+            }
+
+            let path_changed = repo_path != last_repo;
+
+            let changes = match git::get_changes(&repo_path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            let branch = git::get_branch(&repo_path);
+            let unpushed = git::get_unpushed_count(&repo_path);
+            let head_commit = git::get_head_commit_hash(&repo_path);
+
+            let fingerprint = format!(
+                "{}:{}:{}:{}",
+                branch,
+                unpushed,
+                head_commit.as_deref().unwrap_or(""),
+                changes
+                    .iter()
+                    .map(|c| format!("{},{}", c.path, c.status))
+                    .collect::<Vec<_>>()
+                    .join(";")
+            );
+
+            if path_changed || fingerprint != last_fingerprint {
+                last_repo = repo_path.clone();
+                last_fingerprint = fingerprint;
+
+                let history = git::get_history(&repo_path, 50).unwrap_or_default();
+                let _ = tx.send(BgEvent::RepoStateChanged {
+                    path: repo_path,
+                    branch,
+                    changes,
+                    unpushed,
+                    history,
+                });
+            }
+        }
+    });
 }
 
 fn refresh_repo_state(app: &mut App) {
     if git::is_git_repo(&app.repo_path) {
         app.branch = git::get_branch(&app.repo_path);
+        app.unpushed_commits = git::get_unpushed_count(&app.repo_path);
         if let Ok(changes) = git::get_changes(&app.repo_path) {
-            app.changes = changes;
-            app.rebuild_tree();
+            app.update_changes(changes);
         }
         if let Ok(hist) = git::get_history(&app.repo_path, 50) {
             app.history = hist;
@@ -99,14 +182,35 @@ fn run_event_loop(
     config: &config::Config,
     tx: Sender<BgEvent>,
     rx: Receiver<BgEvent>,
+    shared_repo_path: Arc<Mutex<PathBuf>>,
+    is_modal_busy: Arc<AtomicBool>,
 ) {
     let mut needs_render = true;
 
     loop {
+        is_modal_busy.store(!matches!(app.modal, Modal::None), Ordering::Relaxed);
+
         // Poll for background worker events
         while let Ok(event) = rx.try_recv() {
             needs_render = true;
             match event {
+                BgEvent::RepoStateChanged {
+                    path,
+                    branch,
+                    changes,
+                    unpushed,
+                    history,
+                } => {
+                    if path == app.repo_path && matches!(app.modal, Modal::None) {
+                        app.branch = branch;
+                        app.unpushed_commits = unpushed;
+                        app.update_changes(changes);
+                        app.history = history;
+                        if app.selected_history >= app.history.len() && !app.history.is_empty() {
+                            app.selected_history = app.history.len() - 1;
+                        }
+                    }
+                }
                 BgEvent::AiCommitDone(res, is_quick) => match res {
                     Ok(msg) => {
                         if is_quick {
@@ -170,7 +274,7 @@ fn run_event_loop(
                 Ok(Event::Key(key)) => {
                     if key.kind == KeyEventKind::Press {
                         needs_render = true;
-                        if handle_key_event(app, config, &tx, key.code, key.modifiers) {
+                        if handle_key_event(app, config, &tx, &shared_repo_path, key.code, key.modifiers) {
                             break;
                         }
                     }
@@ -191,6 +295,7 @@ fn handle_key_event(
     app: &mut App,
     config: &config::Config,
     tx: &Sender<BgEvent>,
+    shared_repo_path: &Arc<Mutex<PathBuf>>,
     code: KeyCode,
     modifiers: KeyModifiers,
 ) -> bool {
@@ -314,7 +419,10 @@ fn handle_key_event(
                     if git::is_git_repo(&target_path) {
                         let root = git::get_repo_root(&target_path).unwrap_or(target_path);
                         config::save_recent(root.to_str().unwrap_or("."));
-                        app.repo_path = root;
+                        app.repo_path = root.clone();
+                        if let Ok(mut guard) = shared_repo_path.lock() {
+                            *guard = root;
+                        }
                         app.recents = config::load_recents();
                         app.modal = Modal::None;
                         app.clear_status();

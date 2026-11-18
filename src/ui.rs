@@ -79,9 +79,16 @@ pub enum Modal {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SelectedPath {
+    Dir(String),
+    File(String),
+}
+
 pub struct App {
     pub repo_path: PathBuf,
     pub branch: String,
+    pub unpushed_commits: usize,
     pub active_tab: Tab,
     pub changes: Vec<ChangeItem>,
     pub tree_rows: Vec<TreeRow>,
@@ -100,6 +107,7 @@ impl App {
         Self {
             repo_path,
             branch,
+            unpushed_commits: 0,
             active_tab: Tab::Changes,
             changes: Vec::new(),
             tree_rows: Vec::new(),
@@ -128,6 +136,68 @@ impl App {
             .filter(|c| c.selected)
             .map(|c| c.path.clone())
             .collect()
+    }
+
+    pub fn get_selected_tree_path(&self) -> Option<SelectedPath> {
+        if self.selected_row < self.tree_rows.len() {
+            match &self.tree_rows[self.selected_row] {
+                TreeRow::Dir { full_path, .. } => Some(SelectedPath::Dir(full_path.clone())),
+                TreeRow::File { change_idx, .. } => {
+                    self.changes.get(*change_idx).map(|c| SelectedPath::File(c.path.clone()))
+                }
+            }
+        } else {
+            None
+        }
+    }
+
+    pub fn restore_selected_tree_path(&mut self, target: &SelectedPath) {
+        for (i, row) in self.tree_rows.iter().enumerate() {
+            match (target, row) {
+                (SelectedPath::Dir(prev_dir), TreeRow::Dir { full_path, .. }) => {
+                    if prev_dir == full_path {
+                        self.selected_row = i;
+                        return;
+                    }
+                }
+                (SelectedPath::File(prev_file), TreeRow::File { change_idx, .. }) => {
+                    if let Some(c) = self.changes.get(*change_idx) {
+                        if &c.path == prev_file {
+                            self.selected_row = i;
+                            return;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if self.selected_row >= self.tree_rows.len() && !self.tree_rows.is_empty() {
+            self.selected_row = self.tree_rows.len() - 1;
+        }
+    }
+
+    pub fn update_changes(&mut self, new_changes: Vec<ChangeItem>) {
+        let old_selected: std::collections::HashMap<String, bool> = self
+            .changes
+            .iter()
+            .map(|c| (c.path.clone(), c.selected))
+            .collect();
+
+        let mut updated = new_changes;
+        for item in &mut updated {
+            if let Some(&sel) = old_selected.get(&item.path) {
+                item.selected = sel;
+            }
+        }
+
+        let prev_selected_path = self.get_selected_tree_path();
+
+        self.changes = updated;
+        self.rebuild_tree();
+
+        if let Some(target) = prev_selected_path {
+            self.restore_selected_tree_path(&target);
+        }
     }
 
     pub fn rebuild_tree(&mut self) {
@@ -300,7 +370,15 @@ pub fn render(app: &App) {
 
     // Header
     let path_str = app.repo_path.to_str().unwrap_or("?");
-    let header_content = format!(" gitr  │  branch: [{}]  │  {} ", app.branch, path_str);
+    let unpushed_badge = if app.unpushed_commits > 0 {
+        format!(" ↑{}", app.unpushed_commits)
+    } else {
+        String::new()
+    };
+    let header_content = format!(
+        " gitr  │  branch: [{}{}]  │  {} ",
+        app.branch, unpushed_badge, path_str
+    );
     let header_line = truncate_pad(&header_content, w);
     lines.push(format!("\x1b[7m\x1b[1m{}\x1b[0m", header_line));
 
@@ -504,11 +582,26 @@ pub fn render(app: &App) {
     lines.push("\x1b[2m".to_string() + &"─".repeat(w) + "\x1b[0m");
 
     // Footer Line 1: Key hints
-    let footer_hints = match app.active_tab {
-        Tab::Changes => " [Space] Toggle │ [Enter] Fold │ [a] All │ [c] Commit AI │ [C] Quick Commit │ [p] Push │ [o] Repo │ [1/2] Tabs │ [q] Quit",
-        Tab::History => " [j/k] Navigate │ [p] Push │ [o] Repo │ [r] Refresh │ [1/2] Tabs │ [q] Quit",
+    let push_hint = if app.unpushed_commits > 0 {
+        format!(
+            "\x1b[1m\x1b[33m[p] Push ({} unpushed)\x1b[0m\x1b[2m",
+            app.unpushed_commits
+        )
+    } else {
+        "[p] Push (0)".to_string()
     };
-    lines.push(format!("\x1b[2m{}\x1b[0m", truncate_pad(footer_hints, w)));
+
+    let footer_hints = match app.active_tab {
+        Tab::Changes => format!(
+            " [Space] Toggle │ [Enter] Fold │ [a] All │ [c] Commit │ [C] Quick │ {} │ [o] Repo │ [1/2] Tabs │ [q] Quit",
+            push_hint
+        ),
+        Tab::History => format!(
+            " [j/k] Navigate │ {} │ [o] Repo │ [r] Refresh │ [1/2] Tabs │ [q] Quit",
+            push_hint
+        ),
+    };
+    lines.push(pad_or_truncate_ansi(&format!("\x1b[2m{}\x1b[0m", footer_hints), w));
 
     // Footer Line 2: Status
     let status_line = if let Some((msg, is_err)) = &app.status {
@@ -716,14 +809,14 @@ fn embed_in_line(lines: &mut [String], y: usize, x: usize, target_w: usize, cont
     lines[y].push_str(&cursor_jump);
 }
 
-fn strip_ansi_len(s: &str) -> usize {
+pub fn strip_ansi_len(s: &str) -> usize {
     let mut len = 0;
     let mut in_escape = false;
     for c in s.chars() {
         if c == '\x1b' {
             in_escape = true;
         } else if in_escape {
-            if c == 'm' || c == 'G' || c == 'H' || c == 'J' {
+            if c.is_ascii_alphabetic() {
                 in_escape = false;
             }
         } else {
@@ -733,9 +826,115 @@ fn strip_ansi_len(s: &str) -> usize {
     len
 }
 
+pub fn pad_or_truncate_ansi(s: &str, target_w: usize) -> String {
+    let visible_len = strip_ansi_len(s);
+    if visible_len < target_w {
+        let mut res = s.to_string();
+        res.push_str(&" ".repeat(target_w - visible_len));
+        res
+    } else if visible_len == target_w {
+        s.to_string()
+    } else {
+        truncate_ansi(s, target_w)
+    }
+}
+
+pub fn truncate_ansi(s: &str, max_visible: usize) -> String {
+    let mut res = String::new();
+    let mut visible_count = 0;
+    let mut in_escape = false;
+    for c in s.chars() {
+        if c == '\x1b' {
+            in_escape = true;
+            res.push(c);
+        } else if in_escape {
+            res.push(c);
+            if c.is_ascii_alphabetic() {
+                in_escape = false;
+            }
+        } else if visible_count < max_visible {
+            visible_count += 1;
+            res.push(c);
+        }
+    }
+    res.push_str("\x1b[0m");
+    res
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_strip_ansi_and_pad() {
+        let text = "\x1b[1m\x1b[33m[p] Push (2 unpushed)\x1b[0m";
+        let visible_len = strip_ansi_len(text);
+        assert_eq!(visible_len, 21);
+
+        let padded = pad_or_truncate_ansi(text, 25);
+        assert_eq!(strip_ansi_len(&padded), 25);
+
+        let truncated = pad_or_truncate_ansi(text, 10);
+        assert_eq!(strip_ansi_len(&truncated), 10);
+    }
+
+    #[test]
+    fn test_update_changes_preserves_selection_and_cursor() {
+        let mut app = App::new(PathBuf::from("."), "master".to_string(), Vec::new());
+        let initial_changes = vec![
+            ChangeItem {
+                path: "src/main.rs".to_string(),
+                status: "M".to_string(),
+                selected: true,
+            },
+            ChangeItem {
+                path: "src/ui.rs".to_string(),
+                status: "M".to_string(),
+                selected: true,
+            },
+        ];
+        app.changes = initial_changes;
+        app.rebuild_tree();
+
+        // Cursor on ui.rs (row 2: src/ is 0, main.rs is 1, ui.rs is 2)
+        app.selected_row = 2;
+        // User unselects ui.rs
+        app.changes[1].selected = false;
+
+        // New changes arrived with an added file
+        let new_changes = vec![
+            ChangeItem {
+                path: "Cargo.toml".to_string(),
+                status: "M".to_string(),
+                selected: true,
+            },
+            ChangeItem {
+                path: "src/main.rs".to_string(),
+                status: "M".to_string(),
+                selected: true,
+            },
+            ChangeItem {
+                path: "src/ui.rs".to_string(),
+                status: "M".to_string(),
+                selected: true,
+            },
+        ];
+
+        app.update_changes(new_changes);
+
+        // ui.rs must stay unselected!
+        let ui_change = app.changes.iter().find(|c| c.path == "src/ui.rs").unwrap();
+        assert_eq!(ui_change.selected, false);
+
+        // Cursor must still point to ui.rs!
+        let selected_row_item = &app.tree_rows[app.selected_row];
+        match selected_row_item {
+            TreeRow::File { change_idx, .. } => {
+                assert_eq!(app.changes[*change_idx].path, "src/ui.rs");
+            }
+            _ => panic!("Expected cursor to stay on ui.rs"),
+        }
+    }
 
     #[test]
     fn test_tree_rows_nesting() {
@@ -798,5 +997,26 @@ mod tests {
             }
             _ => panic!("Expected File row at index 3"),
         }
+    }
+
+    #[test]
+    fn test_push_hint_formatting() {
+        let mut app = App::new(PathBuf::from("."), "master".to_string(), Vec::new());
+        app.unpushed_commits = 0;
+        let push_hint_zero = if app.unpushed_commits > 0 {
+            format!("\x1b[1m\x1b[33m[p] Push ({} unpushed)\x1b[0m\x1b[2m", app.unpushed_commits)
+        } else {
+            "[p] Push (0)".to_string()
+        };
+        assert_eq!(push_hint_zero, "[p] Push (0)");
+
+        app.unpushed_commits = 3;
+        let push_hint_three = if app.unpushed_commits > 0 {
+            format!("\x1b[1m\x1b[33m[p] Push ({} unpushed)\x1b[0m\x1b[2m", app.unpushed_commits)
+        } else {
+            "[p] Push (0)".to_string()
+        };
+        assert!(push_hint_three.contains("[p] Push (3 unpushed)"));
+        assert_eq!(strip_ansi_len(&push_hint_three), "[p] Push (3 unpushed)".len());
     }
 }
