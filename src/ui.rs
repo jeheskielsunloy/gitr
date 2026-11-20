@@ -64,6 +64,18 @@ pub enum TreeRow {
     },
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ConfirmActionType {
+    Discard,
+    Delete,
+}
+
+pub struct TargetInfo {
+    pub path: String,
+    pub is_dir: bool,
+    pub file_count: usize,
+}
+
 pub enum Modal {
     None,
     CommitReview {
@@ -76,6 +88,12 @@ pub enum Modal {
     },
     Loading {
         title: String,
+    },
+    ConfirmAction {
+        action: ConfirmActionType,
+        target_path: String,
+        is_dir: bool,
+        file_count: usize,
     },
 }
 
@@ -144,6 +162,31 @@ impl App {
                 TreeRow::Dir { full_path, .. } => Some(SelectedPath::Dir(full_path.clone())),
                 TreeRow::File { change_idx, .. } => {
                     self.changes.get(*change_idx).map(|c| SelectedPath::File(c.path.clone()))
+                }
+            }
+        } else {
+            None
+        }
+    }
+
+    pub fn get_selected_target(&self) -> Option<TargetInfo> {
+        if self.selected_row < self.tree_rows.len() {
+            match &self.tree_rows[self.selected_row] {
+                TreeRow::Dir {
+                    full_path,
+                    file_indices,
+                    ..
+                } => Some(TargetInfo {
+                    path: full_path.clone(),
+                    is_dir: true,
+                    file_count: file_indices.len(),
+                }),
+                TreeRow::File { change_idx, .. } => {
+                    self.changes.get(*change_idx).map(|c| TargetInfo {
+                        path: c.path.clone(),
+                        is_dir: false,
+                        file_count: 1,
+                    })
                 }
             }
         } else {
@@ -593,7 +636,7 @@ pub fn render(app: &App) {
 
     let footer_hints = match app.active_tab {
         Tab::Changes => format!(
-            " [Space] Toggle │ [Enter] Fold │ [a] All │ [c] Commit │ [C] Quick │ {} │ [o] Repo │ [1/2] Tabs │ [q] Quit",
+            " [Space] Toggle │ [Enter] Fold │ [d] Discard │ [x] Delete │ [c] Commit │ [C] Quick │ {} │ [o] Repo │ [q] Quit",
             push_hint
         ),
         Tab::History => format!(
@@ -751,6 +794,88 @@ fn overlay_modal(lines: &mut [String], app: &App, width: usize, height: usize) {
             }
 
             let hint = "[Enter] Open   [Tab] Complete Path   [j/k] Select Recent   [Esc] Cancel";
+            draw_text_in_box(
+                lines,
+                start_x + 2,
+                start_y + box_h - 2,
+                inner_w,
+                &format!("\x1b[2m{}\x1b[0m", hint),
+            );
+        }
+        Modal::ConfirmAction {
+            action,
+            target_path,
+            is_dir,
+            file_count,
+        } => {
+            let box_w = 66.min(width.saturating_sub(4));
+            let box_h = 7.min(height.saturating_sub(4));
+            let start_x = (width.saturating_sub(box_w)) / 2;
+            let start_y = (height.saturating_sub(box_h)) / 2;
+
+            let title = match action {
+                ConfirmActionType::Discard => " Discard Changes ",
+                ConfirmActionType::Delete => " Delete File/Directory ",
+            };
+
+            draw_box(lines, start_x, start_y, box_w, box_h, title);
+
+            let inner_w = box_w.saturating_sub(4);
+
+            let display_name = if *is_dir && !target_path.ends_with('/') {
+                format!("{}/", target_path)
+            } else {
+                target_path.clone()
+            };
+
+            let truncated_target = if display_name.len() > inner_w.saturating_sub(25) {
+                let keep = inner_w.saturating_sub(28);
+                format!("...{}", &display_name[display_name.len().saturating_sub(keep)..])
+            } else {
+                display_name
+            };
+
+            let question = match (action, is_dir) {
+                (ConfirmActionType::Discard, false) => {
+                    format!("Discard changes in '{}'?", truncated_target)
+                }
+                (ConfirmActionType::Discard, true) => {
+                    format!("Discard changes in '{}' ({} files)?", truncated_target, file_count)
+                }
+                (ConfirmActionType::Delete, false) => {
+                    format!("Delete '{}'?", truncated_target)
+                }
+                (ConfirmActionType::Delete, true) => {
+                    format!("Delete directory '{}' ({} files)?", truncated_target, file_count)
+                }
+            };
+
+            let warning = match action {
+                ConfirmActionType::Discard => {
+                    "\x1b[33mUncommitted changes will be permanently reverted.\x1b[0m"
+                }
+                ConfirmActionType::Delete => {
+                    "\x1b[31mFile(s) will be permanently deleted from disk.\x1b[0m"
+                }
+            };
+
+            draw_text_in_box(
+                lines,
+                start_x + 2,
+                start_y + 2,
+                inner_w,
+                &format!("\x1b[1m{}\x1b[0m", question),
+            );
+
+            draw_text_in_box(
+                lines,
+                start_x + 2,
+                start_y + 3,
+                inner_w,
+                warning,
+            );
+
+            let hint = "[y/Enter] Confirm    [n/Esc] Cancel";
             draw_text_in_box(
                 lines,
                 start_x + 2,
@@ -1018,5 +1143,37 @@ mod tests {
         };
         assert!(push_hint_three.contains("[p] Push (3 unpushed)"));
         assert_eq!(strip_ansi_len(&push_hint_three), "[p] Push (3 unpushed)".len());
+    }
+
+    #[test]
+    fn test_get_selected_target() {
+        let mut app = App::new(PathBuf::from("."), "master".to_string(), Vec::new());
+        app.changes = vec![
+            ChangeItem {
+                path: "src/main.rs".to_string(),
+                status: "M".to_string(),
+                selected: true,
+            },
+            ChangeItem {
+                path: "src/ui.rs".to_string(),
+                status: "M".to_string(),
+                selected: true,
+            },
+        ];
+        app.rebuild_tree();
+
+        // Row 0 is "src/" dir
+        app.selected_row = 0;
+        let target_dir = app.get_selected_target().unwrap();
+        assert_eq!(target_dir.path, "src");
+        assert!(target_dir.is_dir);
+        assert_eq!(target_dir.file_count, 2);
+
+        // Row 1 is "src/main.rs" file
+        app.selected_row = 1;
+        let target_file = app.get_selected_target().unwrap();
+        assert_eq!(target_file.path, "src/main.rs");
+        assert!(!target_file.is_dir);
+        assert_eq!(target_file.file_count, 1);
     }
 }

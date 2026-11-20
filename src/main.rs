@@ -12,7 +12,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use ui::{App, Modal, Tab, TerminalGuard};
+use ui::{App, ConfirmActionType, Modal, Tab, TerminalGuard};
 
 enum BgEvent {
     AiCommitDone(Result<String, String>, bool /* is_quick */),
@@ -37,7 +37,10 @@ fn main() {
                     KEYS:\n    \
                     [1/2 / Tab]    Switch tabs (Changes / History)\n    \
                     [Space]        Toggle file selection\n    \
+                    [Enter/h/l]    Fold/expand directory\n    \
                     [a]            Toggle select all\n    \
+                    [d]            Discard changes of file/dir\n    \
+                    [x / Del]      Delete file/dir\n    \
                     [c]            Generate AI commit message and review\n    \
                     [C]            Quick commit with AI (no review, no push)\n    \
                     [p]            Git push to remote\n    \
@@ -434,6 +437,47 @@ fn handle_key_event(
             }
             _ => {}
         },
+        Modal::ConfirmAction {
+            action,
+            target_path,
+            is_dir: _,
+            file_count: _,
+        } => match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                let action_type = *action;
+                let path = target_path.clone();
+                app.modal = Modal::None;
+                match action_type {
+                    ConfirmActionType::Discard => {
+                        match git::discard_changes(&app.repo_path, &path) {
+                            Ok(_) => {
+                                app.set_status(&format!("Discarded changes in {}", path), false);
+                                refresh_repo_state(app);
+                            }
+                            Err(e) => {
+                                app.set_status(&format!("Discard failed: {}", e), true);
+                            }
+                        }
+                    }
+                    ConfirmActionType::Delete => {
+                        match git::delete_path(&app.repo_path, &path) {
+                            Ok(_) => {
+                                app.set_status(&format!("Deleted {}", path), false);
+                                refresh_repo_state(app);
+                            }
+                            Err(e) => {
+                                app.set_status(&format!("Delete failed: {}", e), true);
+                            }
+                        }
+                    }
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                app.modal = Modal::None;
+                app.set_status("Operation cancelled", false);
+            }
+            _ => {}
+        },
         Modal::None => match code {
             KeyCode::Char('q') => {
                 return true;
@@ -515,6 +559,32 @@ fn handle_key_event(
             }
             KeyCode::Char('C') if app.active_tab == Tab::Changes => {
                 start_ai_commit(app, config, tx, true);
+            }
+            KeyCode::Char('d') if app.active_tab == Tab::Changes => {
+                if let Some(target) = app.get_selected_target() {
+                    app.modal = Modal::ConfirmAction {
+                        action: ConfirmActionType::Discard,
+                        target_path: target.path,
+                        is_dir: target.is_dir,
+                        file_count: target.file_count,
+                    };
+                } else {
+                    app.set_status("No file or directory selected to discard", true);
+                }
+            }
+            KeyCode::Char('x') | KeyCode::Char('D') | KeyCode::Delete
+                if app.active_tab == Tab::Changes =>
+            {
+                if let Some(target) = app.get_selected_target() {
+                    app.modal = Modal::ConfirmAction {
+                        action: ConfirmActionType::Delete,
+                        target_path: target.path,
+                        is_dir: target.is_dir,
+                        file_count: target.file_count,
+                    };
+                } else {
+                    app.set_status("No file or directory selected to delete", true);
+                }
             }
             _ => {}
         },

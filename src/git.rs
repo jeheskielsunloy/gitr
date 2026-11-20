@@ -339,9 +339,106 @@ pub fn push(path: &Path) -> Result<String, String> {
     }
 }
 
+pub fn discard_changes(path: &Path, target: &str) -> Result<(), String> {
+    let path_str = path.to_str().unwrap_or(".");
+
+    // 1. Try git restore --staged --worktree -- <target>
+    let restore_output = Command::new("git")
+        .args(["-C", path_str, "restore", "--staged", "--worktree", "--", target])
+        .output();
+
+    if let Ok(ref out) = restore_output {
+        if !out.status.success() {
+            // Fallback for repos with no HEAD commit yet
+            let _ = Command::new("git")
+                .args(["-C", path_str, "rm", "--cached", "-r", "-f", "--", target])
+                .output();
+        }
+    }
+
+    // 2. Clean untracked files and directories
+    let clean_output = Command::new("git")
+        .args(["-C", path_str, "clean", "-fd", "--", target])
+        .output()
+        .map_err(|e| format!("git clean failed: {}", e))?;
+
+    if !clean_output.status.success() {
+        let stderr = String::from_utf8_lossy(&clean_output.stderr).trim().to_string();
+        if !stderr.is_empty() {
+            return Err(stderr);
+        }
+    }
+
+    Ok(())
+}
+
+pub fn delete_path(path: &Path, target: &str) -> Result<(), String> {
+    let full_path = path.join(target);
+    let path_str = path.to_str().unwrap_or(".");
+
+    if full_path.exists() {
+        if full_path.is_dir() {
+            std::fs::remove_dir_all(&full_path)
+                .map_err(|e| format!("Failed to delete directory '{}': {}", target, e))?;
+        } else {
+            std::fs::remove_file(&full_path)
+                .map_err(|e| format!("Failed to delete file '{}': {}", target, e))?;
+        }
+    } else {
+        // If file doesn't exist on disk (already deleted in working tree), stage the deletion
+        let _ = Command::new("git")
+            .args(["-C", path_str, "add", "-A", "--", target])
+            .output();
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_git_discard_and_delete() {
+        use std::fs;
+        let temp_dir = std::env::temp_dir().join(format!("gitr_test_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let _ = fs::create_dir_all(&temp_dir);
+
+        let _ = Command::new("git").args(["init", temp_dir.to_str().unwrap()]).output();
+        let _ = Command::new("git").args(["-C", temp_dir.to_str().unwrap(), "config", "user.name", "Test"]).output();
+        let _ = Command::new("git").args(["-C", temp_dir.to_str().unwrap(), "config", "user.email", "test@test.com"]).output();
+
+        // 1. Initial commit
+        let f1 = temp_dir.join("f1.txt");
+        let _ = fs::write(&f1, "hello");
+        let _ = Command::new("git").args(["-C", temp_dir.to_str().unwrap(), "add", "f1.txt"]).output();
+        let _ = Command::new("git").args(["-C", temp_dir.to_str().unwrap(), "commit", "-m", "init"]).output();
+
+        // 2. Modify f1.txt and create untracked f2.txt
+        let _ = fs::write(&f1, "modified");
+        let f2 = temp_dir.join("f2.txt");
+        let _ = fs::write(&f2, "untracked");
+
+        // Discard f2.txt (untracked)
+        assert!(discard_changes(&temp_dir, "f2.txt").is_ok());
+        assert!(!f2.exists());
+
+        // Discard f1.txt (modified)
+        assert!(discard_changes(&temp_dir, "f1.txt").is_ok());
+        assert_eq!(fs::read_to_string(&f1).unwrap(), "hello");
+
+        // 3. Delete f1.txt (tracked)
+        assert!(delete_path(&temp_dir, "f1.txt").is_ok());
+        assert!(!f1.exists());
+
+        // Discard f1.txt to restore it
+        assert!(discard_changes(&temp_dir, "f1.txt").is_ok());
+        assert!(f1.exists());
+        assert_eq!(fs::read_to_string(&f1).unwrap(), "hello");
+
+        // Cleanup
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
 
     #[test]
     fn test_git_repo_detection() {
