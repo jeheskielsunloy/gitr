@@ -1,11 +1,14 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChangeItem {
     pub path: String,
     pub status: String,
     pub selected: bool,
+    pub added: usize,
+    pub deleted: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -63,9 +66,117 @@ pub fn get_branch(path: &Path) -> String {
     "init".to_string()
 }
 
+pub fn parse_numstat_path(s: &str) -> String {
+    let s = s.trim_matches('"');
+    if s.contains('{') && s.contains('}') {
+        if let Some((before_brace, rest)) = s.split_once('{') {
+            if let Some((inside, after_brace)) = rest.split_once('}') {
+                if let Some((_, dest)) = inside.split_once(" => ") {
+                    let mut res = format!("{}{}{}", before_brace, dest, after_brace);
+                    while res.contains("//") {
+                        res = res.replace("//", "/");
+                    }
+                    return res;
+                }
+            }
+        }
+    }
+    if let Some((_, dest)) = s.split_once(" => ") {
+        return dest.to_string();
+    }
+    s.to_string()
+}
+
+pub fn count_file_lines(path: &Path) -> (usize, usize) {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return (0, 0);
+    };
+    if !metadata.is_file() || metadata.len() > 50 * 1024 * 1024 {
+        return (0, 0);
+    }
+
+    let Ok(bytes) = std::fs::read(path) else {
+        return (0, 0);
+    };
+
+    if bytes.is_empty() {
+        return (0, 0);
+    }
+
+    let check_len = bytes.len().min(8000);
+    if bytes[..check_len].contains(&0) {
+        return (0, 0);
+    }
+
+    let mut lines = 0;
+    for &b in &bytes {
+        if b == b'\n' {
+            lines += 1;
+        }
+    }
+    if bytes.last() != Some(&b'\n') {
+        lines += 1;
+    }
+
+    (lines, 0)
+}
+
+fn parse_numstat_output(stdout: &[u8], stats: &mut HashMap<String, (usize, usize)>) {
+    let text = String::from_utf8_lossy(stdout);
+    for line in text.lines() {
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() >= 3 {
+            let added = parts[0].parse::<usize>().unwrap_or(0);
+            let deleted = parts[1].parse::<usize>().unwrap_or(0);
+            let path_part = parts[2..].join("\t");
+            let clean_path = parse_numstat_path(&path_part);
+            let entry = stats.entry(clean_path).or_insert((0, 0));
+            entry.0 += added;
+            entry.1 += deleted;
+        }
+    }
+}
+
+pub fn get_numstats(path: &Path) -> HashMap<String, (usize, usize)> {
+    let mut stats = HashMap::new();
+    let path_str = path.to_str().unwrap_or(".");
+
+    let head_exists = get_head_commit_hash(path).is_some();
+
+    if head_exists {
+        if let Ok(output) = Command::new("git")
+            .args(["-C", path_str, "-c", "core.quotePath=false", "diff", "HEAD", "--numstat"])
+            .output()
+        {
+            if output.status.success() {
+                parse_numstat_output(&output.stdout, &mut stats);
+            }
+        }
+    } else {
+        if let Ok(output) = Command::new("git")
+            .args(["-C", path_str, "-c", "core.quotePath=false", "diff", "--cached", "--numstat"])
+            .output()
+        {
+            if output.status.success() {
+                parse_numstat_output(&output.stdout, &mut stats);
+            }
+        }
+        if let Ok(output) = Command::new("git")
+            .args(["-C", path_str, "-c", "core.quotePath=false", "diff", "--numstat"])
+            .output()
+        {
+            if output.status.success() {
+                parse_numstat_output(&output.stdout, &mut stats);
+            }
+        }
+    }
+
+    stats
+}
+
 pub fn get_changes(path: &Path) -> Result<Vec<ChangeItem>, String> {
     let output = Command::new("git")
-        .args(["-C", path.to_str().unwrap_or("."), "status", "--porcelain=v1", "-uall"])
+        .args(["-C", path.to_str().unwrap_or("."), "-c", "core.quotePath=false", "status", "--porcelain=v1", "-uall"])
         .output()
         .map_err(|e| format!("Failed to run git status: {}", e))?;
 
@@ -75,6 +186,7 @@ pub fn get_changes(path: &Path) -> Result<Vec<ChangeItem>, String> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut changes = Vec::new();
+    let numstats = get_numstats(path);
 
     for line in stdout.lines() {
         if line.len() < 4 {
@@ -88,11 +200,22 @@ pub fn get_changes(path: &Path) -> Result<Vec<ChangeItem>, String> {
         } else {
             file_path.to_string()
         };
+        let clean_path = clean_path.trim_matches('"').to_string();
+
+        let (added, deleted) = if let Some(&(a, d)) = numstats.get(&clean_path) {
+            (a, d)
+        } else if status == "?" || status == "??" {
+            count_file_lines(&path.join(&clean_path))
+        } else {
+            (0, 0)
+        };
 
         changes.push(ChangeItem {
             path: clean_path,
             status,
             selected: true,
+            added,
+            deleted,
         });
     }
 
@@ -464,6 +587,78 @@ mod tests {
         let count = get_unpushed_count(current);
         // Valid usize returned
         assert!(count < 100_000);
+    }
+
+    #[test]
+    fn test_parse_numstat_path() {
+        assert_eq!(parse_numstat_path("src/{old => new}/test.txt"), "src/new/test.txt");
+        assert_eq!(parse_numstat_path("{old => new}/test.txt"), "new/test.txt");
+        assert_eq!(parse_numstat_path("src/{old.txt => new.txt}"), "src/new.txt");
+        assert_eq!(parse_numstat_path("old.txt => new.txt"), "new.txt");
+        assert_eq!(parse_numstat_path("src/{dir/ => }test.txt"), "src/test.txt");
+        assert_eq!(parse_numstat_path("normal/path/file.rs"), "normal/path/file.rs");
+        assert_eq!(parse_numstat_path("\"file with spaces.txt\""), "file with spaces.txt");
+    }
+
+    #[test]
+    fn test_count_file_lines() {
+        use std::fs;
+        let temp_dir = std::env::temp_dir().join(format!("gitr_lines_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let _ = fs::create_dir_all(&temp_dir);
+
+        let f1 = temp_dir.join("f1.txt");
+        fs::write(&f1, "a\nb\nc").unwrap();
+        assert_eq!(count_file_lines(&f1), (3, 0));
+
+        let f2 = temp_dir.join("f2.txt");
+        fs::write(&f2, "hello\nworld\n").unwrap();
+        assert_eq!(count_file_lines(&f2), (2, 0));
+
+        let f_empty = temp_dir.join("empty.txt");
+        fs::write(&f_empty, "").unwrap();
+        assert_eq!(count_file_lines(&f_empty), (0, 0));
+
+        let f_bin = temp_dir.join("bin.dat");
+        fs::write(&f_bin, [0u8, 1, 2, 3]).unwrap();
+        assert_eq!(count_file_lines(&f_bin), (0, 0));
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_git_changes_line_counts() {
+        use std::fs;
+        let temp_dir = std::env::temp_dir().join(format!("gitr_changes_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let _ = fs::create_dir_all(&temp_dir);
+
+        let _ = Command::new("git").args(["init", temp_dir.to_str().unwrap()]).output();
+        let _ = Command::new("git").args(["-C", temp_dir.to_str().unwrap(), "config", "user.name", "Test"]).output();
+        let _ = Command::new("git").args(["-C", temp_dir.to_str().unwrap(), "config", "user.email", "test@test.com"]).output();
+
+        let f1 = temp_dir.join("tracked.txt");
+        fs::write(&f1, "line1\nline2\nline3\n").unwrap();
+        let _ = Command::new("git").args(["-C", temp_dir.to_str().unwrap(), "add", "tracked.txt"]).output();
+        let _ = Command::new("git").args(["-C", temp_dir.to_str().unwrap(), "commit", "-m", "init"]).output();
+
+        // Modify tracked.txt: delete line3, add line4 and line5
+        fs::write(&f1, "line1\nline2\nline4\nline5\n").unwrap();
+
+        // Create untracked file with 3 lines
+        let f2 = temp_dir.join("untracked.txt");
+        fs::write(&f2, "x\ny\nz\n").unwrap();
+
+        let changes = get_changes(&temp_dir).unwrap();
+        assert_eq!(changes.len(), 2);
+
+        let tracked = changes.iter().find(|c| c.path == "tracked.txt").unwrap();
+        assert_eq!(tracked.added, 2);
+        assert_eq!(tracked.deleted, 1);
+
+        let untracked = changes.iter().find(|c| c.path == "untracked.txt").unwrap();
+        assert_eq!(untracked.added, 3);
+        assert_eq!(untracked.deleted, 0);
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 
     #[test]

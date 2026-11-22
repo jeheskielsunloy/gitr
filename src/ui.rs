@@ -402,6 +402,33 @@ fn flatten_dir(
 
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
+pub fn format_diff_stat(added: usize, deleted: usize) -> (String, usize) {
+    if added == 0 && deleted == 0 {
+        return (String::new(), 0);
+    }
+
+    match (added, deleted) {
+        (a, 0) => {
+            let plain = format!("+{}", a);
+            let len = plain.len();
+            let ansi = format!("\x1b[32m{}\x1b[0m", plain);
+            (ansi, len)
+        }
+        (0, d) => {
+            let plain = format!("-{}", d);
+            let len = plain.len();
+            let ansi = format!("\x1b[31m{}\x1b[0m", plain);
+            (ansi, len)
+        }
+        (a, d) => {
+            let plain = format!("+{} -{}", a, d);
+            let len = plain.len();
+            let ansi = format!("\x1b[32m+{}\x1b[0m \x1b[31m-{}\x1b[0m", a, d);
+            (ansi, len)
+        }
+    }
+}
+
 pub fn render(app: &App) {
     let (width, height) = size().unwrap_or((100, 30));
     let mut out = stdout();
@@ -506,20 +533,23 @@ pub fn render(app: &App) {
                                     String::new()
                                 };
 
+                                let dir_added: usize =
+                                    file_indices.iter().map(|&fi| app.changes[fi].added).sum();
+                                let dir_deleted: usize =
+                                    file_indices.iter().map(|&fi| app.changes[fi].deleted).sum();
+                                let (diff_stat, _) = format_diff_stat(dir_added, dir_deleted);
+                                let stat_suffix = if !diff_stat.is_empty() {
+                                    format!("  {}", diff_stat)
+                                } else {
+                                    String::new()
+                                };
+
                                 let content = format!(
-                                    " {} {}{} {} \x1b[1m\x1b[34m{}\x1b[0m\x1b[2m{}\x1b[0m",
-                                    cursor_mark, indent, check_mark, arrow, name, count_note
+                                    " {} {}{} {} \x1b[1m\x1b[34m{}\x1b[0m\x1b[2m{}\x1b[0m{}",
+                                    cursor_mark, indent, check_mark, arrow, name, count_note, stat_suffix
                                 );
-                                let plain_len = 1
-                                    + 1
-                                    + indent.len()
-                                    + 3
-                                    + 1
-                                    + 1
-                                    + 1
-                                    + name.len()
-                                    + count_note.len();
-                                (content, plain_len)
+                                let clean_len = strip_ansi_len(&content);
+                                (content, clean_len)
                             }
                             TreeRow::File {
                                 name,
@@ -543,19 +573,19 @@ pub fn render(app: &App) {
                                 };
 
                                 let indent = "  ".repeat(*depth);
+                                let (diff_stat, _) = format_diff_stat(change.added, change.deleted);
+                                let stat_suffix = if !diff_stat.is_empty() {
+                                    format!("  {}", diff_stat)
+                                } else {
+                                    String::new()
+                                };
+
                                 let content = format!(
-                                    " {} {}{} {}  {}",
-                                    cursor_mark, indent, check_mark, status_tag, name
+                                    " {} {}{} {}  {}{}",
+                                    cursor_mark, indent, check_mark, status_tag, name, stat_suffix
                                 );
-                                let plain_len = 1
-                                    + 1
-                                    + indent.len()
-                                    + 3
-                                    + 1
-                                    + change.status.len()
-                                    + 2
-                                    + name.len();
-                                (content, plain_len)
+                                let clean_len = strip_ansi_len(&content);
+                                (content, clean_len)
                             }
                         };
 
@@ -565,10 +595,16 @@ pub fn render(app: &App) {
                             String::new()
                         };
 
-                        if is_cursor {
-                            lines.push(format!("\x1b[48;5;236m{}{}\x1b[0m", row_content, pad));
+                        let line_to_draw = if clean_len > w {
+                            truncate_ansi(&row_content, w)
                         } else {
-                            lines.push(format!("{}{}", row_content, pad));
+                            format!("{}{}", row_content, pad)
+                        };
+
+                        if is_cursor {
+                            lines.push(format!("\x1b[48;5;236m{}\x1b[0m", line_to_draw));
+                        } else {
+                            lines.push(line_to_draw);
                         }
                     } else {
                         lines.push(" ".repeat(w));
@@ -1011,11 +1047,15 @@ mod tests {
                 path: "src/main.rs".to_string(),
                 status: "M".to_string(),
                 selected: true,
+                added: 10,
+                deleted: 2,
             },
             ChangeItem {
                 path: "src/ui.rs".to_string(),
                 status: "M".to_string(),
                 selected: true,
+                added: 5,
+                deleted: 0,
             },
         ];
         app.changes = initial_changes;
@@ -1032,16 +1072,22 @@ mod tests {
                 path: "Cargo.toml".to_string(),
                 status: "M".to_string(),
                 selected: true,
+                added: 1,
+                deleted: 0,
             },
             ChangeItem {
                 path: "src/main.rs".to_string(),
                 status: "M".to_string(),
                 selected: true,
+                added: 10,
+                deleted: 2,
             },
             ChangeItem {
                 path: "src/ui.rs".to_string(),
                 status: "M".to_string(),
                 selected: true,
+                added: 5,
+                deleted: 0,
             },
         ];
 
@@ -1068,16 +1114,22 @@ mod tests {
                 path: "src/main.rs".to_string(),
                 status: "M".to_string(),
                 selected: true,
+                added: 1,
+                deleted: 1,
             },
             ChangeItem {
                 path: "src/ui.rs".to_string(),
                 status: "M".to_string(),
                 selected: true,
+                added: 2,
+                deleted: 0,
             },
             ChangeItem {
                 path: "Cargo.toml".to_string(),
                 status: "M".to_string(),
                 selected: true,
+                added: 0,
+                deleted: 1,
             },
         ];
 
@@ -1146,6 +1198,27 @@ mod tests {
     }
 
     #[test]
+    fn test_format_diff_stat() {
+        assert_eq!(format_diff_stat(0, 0), (String::new(), 0));
+
+        let (stat_add, len_add) = format_diff_stat(5, 0);
+        assert_eq!(len_add, 2);
+        assert_eq!(strip_ansi_len(&stat_add), 2);
+        assert!(stat_add.contains("+5"));
+
+        let (stat_del, len_del) = format_diff_stat(0, 3);
+        assert_eq!(len_del, 2);
+        assert_eq!(strip_ansi_len(&stat_del), 2);
+        assert!(stat_del.contains("-3"));
+
+        let (stat_both, len_both) = format_diff_stat(12, 4);
+        assert_eq!(len_both, 6);
+        assert_eq!(strip_ansi_len(&stat_both), 6);
+        assert!(stat_both.contains("+12"));
+        assert!(stat_both.contains("-4"));
+    }
+
+    #[test]
     fn test_get_selected_target() {
         let mut app = App::new(PathBuf::from("."), "master".to_string(), Vec::new());
         app.changes = vec![
@@ -1153,11 +1226,15 @@ mod tests {
                 path: "src/main.rs".to_string(),
                 status: "M".to_string(),
                 selected: true,
+                added: 0,
+                deleted: 0,
             },
             ChangeItem {
                 path: "src/ui.rs".to_string(),
                 status: "M".to_string(),
                 selected: true,
+                added: 0,
+                deleted: 0,
             },
         ];
         app.rebuild_tree();
@@ -1175,5 +1252,49 @@ mod tests {
         assert_eq!(target_file.path, "src/main.rs");
         assert!(!target_file.is_dir);
         assert_eq!(target_file.file_count, 1);
+    }
+
+    #[test]
+    fn test_tree_directory_diff_stat_aggregation() {
+        let mut app = App::new(PathBuf::from("."), "master".to_string(), Vec::new());
+        app.changes = vec![
+            ChangeItem {
+                path: "src/main.rs".to_string(),
+                status: "M".to_string(),
+                selected: true,
+                added: 15,
+                deleted: 3,
+            },
+            ChangeItem {
+                path: "src/ui.rs".to_string(),
+                status: "M".to_string(),
+                selected: true,
+                added: 5,
+                deleted: 2,
+            },
+            ChangeItem {
+                path: "Cargo.toml".to_string(),
+                status: "M".to_string(),
+                selected: true,
+                added: 1,
+                deleted: 0,
+            },
+        ];
+        app.rebuild_tree();
+
+        // Row 0 should be "src/"
+        match &app.tree_rows[0] {
+            TreeRow::Dir { file_indices, .. } => {
+                let dir_added: usize = file_indices.iter().map(|&fi| app.changes[fi].added).sum();
+                let dir_deleted: usize = file_indices.iter().map(|&fi| app.changes[fi].deleted).sum();
+                assert_eq!(dir_added, 20); // 15 + 5
+                assert_eq!(dir_deleted, 5); // 3 + 2
+                let (stat, len) = format_diff_stat(dir_added, dir_deleted);
+                assert_eq!(len, 6); // "+20 -5"
+                assert!(stat.contains("+20"));
+                assert!(stat.contains("-5"));
+            }
+            _ => panic!("Expected row 0 to be Dir"),
+        }
     }
 }

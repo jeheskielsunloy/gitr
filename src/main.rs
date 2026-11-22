@@ -142,7 +142,7 @@ fn start_repo_watcher(
                 head_commit.as_deref().unwrap_or(""),
                 changes
                     .iter()
-                    .map(|c| format!("{},{}", c.path, c.status))
+                    .map(|c| format!("{},{},{},{}", c.path, c.status, c.added, c.deleted))
                     .collect::<Vec<_>>()
                     .join(";")
             );
